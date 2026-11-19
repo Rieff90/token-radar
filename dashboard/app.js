@@ -1,7 +1,8 @@
 // Token Radar's page: one static file, no framework, no network.
-// window.RADAR (written to /output/data.js by main.ts) carries the board, the live-token set, the peer
-// table and the model's constants. Everything below renders that object; nothing is fetched and nothing
-// is computed twice — the farm plan a reader sees is the exact string board.json carries.
+// window.RADAR (written to /output/data.js by main.ts) carries the board, the live-token set, the fitted
+// size curve, the model's backtest and its constants. Everything below renders that object; nothing is
+// fetched and nothing is computed twice — the farm plan a reader sees is the exact string board.json
+// carries, and every number in a detail view is the one the board ranked.
 
 (() => {
   'use strict';
@@ -16,6 +17,10 @@
   const state = { q: '', cat: '', chain: '', watchlist: false, sort: 'rank', asc: true };
   const MAX = Math.max(...R.rows.map((r) => r.implied_value_usd), 1);
   const top10 = R.rows.slice(0, 10).reduce((n, r) => n + r.implied_value_usd, 0);
+  const CURVE = R.curve;
+
+  /** The size curve's multiple at a TVL: 2^a x tvl^(b-1), the same function lib/model.ts runs. */
+  const curveAt = (tvl) => Math.min(2.5, Math.max(0.005, 2 ** (CURVE.a + (CURVE.b - 1) * Math.log2(tvl))));
 
   // ---------- formatting ----------
 
@@ -31,6 +36,7 @@
   const dir = (n) => (n === null ? 'flat' : n > 0.05 ? 'up' : n < -0.05 ? 'down' : 'flat');
   const days = (n) => (n === null ? '—' : n >= 365 ? `${(n / 365).toFixed(1)}y` : `${n}d`);
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const mult = (m) => (m >= 0.1 ? `${m.toFixed(2)}x` : m >= 0.01 ? `${m.toFixed(3)}x` : `${m.toFixed(4)}x`);
 
   /** "action Cost: $150 of capital. Time: 15 minutes." -> [action, cost, time] */
   function splitStep(s) {
@@ -54,7 +60,7 @@
       if (state.cat && r.category !== state.cat) return false;
       if (state.chain && !r.chains.includes(state.chain)) return false;
       if (state.watchlist && !r.watchlist) return false;
-      if (q && !(`${r.name} ${r.slug} ${r.category || ''} ${r.chains.join(' ')}`.toLowerCase().includes(q))) return false;
+      if (q && !`${r.name} ${r.slug} ${r.category || ''} ${r.chains.join(' ')}`.toLowerCase().includes(q)) return false;
       return true;
     });
     const key = state.sort;
@@ -74,55 +80,137 @@
       </div>
       <span class="spacer"></span>
       <span class="chip cyan">snapshot <b>${esc(R.as_of)}</b></span>
-      <span class="chip">${esc(String(R.protocols_size))} protocols · <b>${esc(String(R.pre_token_size))}</b> without a token</span>
+      <span class="chip">${R.protocols_size} protocols · <b>${R.pre_token_size}</b> without a token</span>
       <span class="chip amber">model <b>${esc(R.model_version)}</b></span>`;
   }
 
   function stats() {
+    const v = R.validation;
     return `
       <div class="stat"><div class="k">Board rows</div><div class="v">${R.board_size}</div><div class="s">${R.watchlist_size} watchlist + ${R.early_size} early</div></div>
       <div class="stat"><div class="k">Top implied launch</div><div class="v amber">${usd(R.rows[0].implied_value_usd)}</div><div class="s">${esc(R.rows[0].name)}</div></div>
       <div class="stat"><div class="k">Top 10, implied</div><div class="v">${usd(top10)}</div><div class="s">what the first ten launches would be worth</div></div>
-      <div class="stat"><div class="k">Market multiple</div><div class="v cyan">${R.global_multiple.toFixed(2)}x</div><div class="s">median market cap per $1 of TVL, live-token peers</div></div>`;
+      <div class="stat"><div class="k">Backtest error</div><div class="v cyan">${v.median_error.toFixed(1)}x</div><div class="s">median, ${v.n} live-token protocols left out in turn</div></div>`;
+  }
+
+  function accounting() {
+    const a = R.accounting;
+    return `
+      <div class="panel" id="accounting">
+        <div class="body" style="padding:12px 16px">
+          <div class="acct">
+            <span class="chip">all <b>${a.total}</b> snapshot protocols accounted for</span>
+            <span class="chip amber"><b>${a.ranked}</b> ranked here</span>
+            <span class="chip cyan"><b>${a.live_token}</b> already trading</span>
+            ${a.excluded.map((e) => `<span class="chip"><b>${e.n}</b> ${esc(e.reason)}</span>`).join('')}
+          </div>
+        </div>
+      </div>`;
   }
 
   function method() {
-    const peers = R.peer_multiples.slice(0, 10);
-    const maxUsed = Math.max(...R.peer_multiples.map((p) => p.used), 0.01);
+    const peers = R.peer_multiples.filter((p) => p.source === 'category').slice(0, 8);
+    const maxTilt = Math.max(...R.peer_multiples.map((p) => p.used), 0.01);
+    const sample = [10e6, 100e6, 1e9, Math.max(...R.rows.map((r) => r.tvl_usd))];
     return `
       <section class="panel" id="method">
         <header>
           <h2>The model</h2>
-          <span class="sub">implied value of a token that does not exist yet, from the snapshot's own figures</span>
+          <span class="sub">what a token would be worth if the protocol's record stayed as it is</span>
         </header>
         <div class="body">
           <div class="formula">
-            implied = TVL × <b>peerMultiple</b> × <i>growth</i> × <i>maturity</i> × <i>reach</i><br>
-            <b>peerMultiple</b> = median(mcap ÷ TVL) of the category's live-token peers, at least ${R.model.peer_min} of them<br>
-            <i>growth</i> = 1 + clamp(change_7d, ${R.model.growth_floor}, +${R.model.growth_cap})% × ${R.model.growth_weight} &nbsp;·&nbsp; <i>maturity</i> = ${R.model.maturity_floor} + min(age, ${R.model.maturity_days})d ÷ ${R.model.maturity_days} × ${R.model.maturity_range} &nbsp;·&nbsp; <i>reach</i> = 1 + ${R.model.chain_weight} × (chains − 1)
+            implied = TVL × <b>curve(TVL)</b> × <i>tilt</i> × <i>growth</i> × <i>maturity</i> × <i>reach</i><br>
+            <b>curve(TVL)</b> = 2<sup>${CURVE.a.toFixed(3)}</sup> × TVL<sup>${(CURVE.b - 1).toFixed(3)}</sup> &nbsp;<span style="color:var(--ink-faint)">fitted on the snapshot's ${CURVE.n} live-token protocols</span><br>
+            <i>tilt</i> = √(category median multiple ÷ market median), ${R.model.tilt_floor}–${R.model.tilt_cap} &nbsp;·&nbsp; <i>growth</i> = 1 + clamp(7d, ${R.model.growth_floor}, +${R.model.growth_cap})% × ${R.model.growth_weight}<br>
+            <i>maturity</i> = ${R.model.maturity_floor} + min(age, ${R.model.maturity_days})d ÷ ${R.model.maturity_days} × ${R.model.maturity_range} &nbsp;·&nbsp; <i>reach</i> = 1 + ${R.model.chain_weight} × (chains − 1)
           </div>
           <ul class="notes">
-            <li>Every multiple is measured inside the snapshot: the live-token protocols in the same category are what the market already pays for one dollar of that kind of TVL. No name is special-cased.</li>
-            <li>A category with fewer than ${R.model.peer_min} live-token peers is priced at the whole market's ${R.global_multiple.toFixed(2)}x, and the row says so — one outlier never sets a category's price.</li>
-            <li>Protocols whose token already trades are never ranked: they are the market's own values, listed apart at the foot of the page.</li>
-            <li>Age counts the days the protocol has run with no token: the longer it has held deposits without issuing one, the more of a launch its TVL implies.</li>
+            <li><b>The multiple is measured, not assumed.</b> The market's own live-token protocols say what a dollar of TVL buys at each size, and the fit is refitted from whatever snapshot the entry is handed. Nothing here is a hardcoded list of names or a fixed multiple.</li>
+            <li><b>The multiple falls with size.</b> A protocol holding $10M of TVL is priced near ${curveAt(10e6).toFixed(2)}x; one holding $1B near ${curveAt(1e9).toFixed(3)}x. That is the snapshot's own market, not a preference of this model.</li>
+            <li><b>The tilt is earned.</b> A category whose live peers trade above the market's median is tilted up, below it down, by at most ${R.model.tilt_cap}× — and only when at least ${R.model.peer_min} live-token peers back it. Below that the row says "no tilt".</li>
+            <li><b>Age and growth are small adjustments on purpose.</b> The backtest below shows TVL carries most of the signal; the other three multipliers move a row, they do not decide it.</li>
           </ul>
           <table class="peers">
-            <thead><tr><th>Category</th><th class="n">Live peers</th><th class="n">Median mcap/TVL</th><th class="n">Multiple used</th><th style="width:110px"></th></tr></thead>
+            <thead><tr><th>What the curve pays</th><th class="n">Multiple of TVL</th><th style="width:120px"></th></tr></thead>
             <tbody>
-              ${peers
+              ${sample
                 .map(
-                  (p) => `<tr>
-                    <td>${esc(p.category)}${p.source === 'market' ? ' <span class="pill" style="font-size:10px">market</span>' : ''}</td>
-                    <td class="n">${p.peers}</td>
-                    <td class="n">${p.median.toFixed(2)}x</td>
-                    <td class="n">${p.used.toFixed(2)}x</td>
-                    <td><div class="bar" style="width:${Math.max(2, Math.round((p.used / maxUsed) * 100))}%"></div></td>
-                  </tr>`,
+                  (t) => `<tr><td>at ${usd(t)} of TVL</td><td class="n">${mult(curveAt(t))}</td><td><div class="bar" style="width:${Math.max(3, Math.round((curveAt(t) / Math.max(...sample.map(curveAt))) * 100))}%"></div></td></tr>`,
                 )
                 .join('')}
             </tbody>
           </table>
+          ${
+            peers.length
+              ? `<table class="peers" style="margin-top:14px">
+            <thead><tr><th>Category tilt</th><th class="n">Live peers</th><th class="n">Median mcap/TVL</th><th class="n">Tilt</th><th style="width:110px"></th></tr></thead>
+            <tbody>
+              ${peers
+                .map(
+                  (p) => `<tr><td>${esc(p.category)}</td><td class="n">${p.peers}</td><td class="n">${mult(p.median)}</td><td class="n">${p.used.toFixed(2)}x</td><td><div class="bar" style="width:${Math.max(3, Math.round((p.used / maxTilt) * 100))}%"></div></td></tr>`,
+                )
+                .join('')}
+            </tbody>
+          </table>`
+              : ''
+          }
+        </div>
+      </section>`;
+  }
+
+  /** A log-log scatter of what the model would have said against what the market says, in SVG. */
+  function scatter(points) {
+    const W = 660;
+    const H = 300;
+    const pad = { l: 54, r: 14, t: 14, b: 34 };
+    const vals = points.flatMap((p) => [p.actual_usd, p.implied_usd]).filter((v) => v > 0);
+    const lo = Math.floor(Math.log10(Math.min(...vals)));
+    const hi = Math.ceil(Math.log10(Math.max(...vals)));
+    const x = (v) => pad.l + ((Math.log10(v) - lo) / (hi - lo)) * (W - pad.l - pad.r);
+    const y = (v) => H - pad.b - ((Math.log10(v) - lo) / (hi - lo)) * (H - pad.t - pad.b);
+    const ticks = [];
+    for (let e = lo; e <= hi; e++) ticks.push(10 ** e);
+    const label = (v) => (v >= 1e9 ? `$${Math.round(v / 1e9)}B` : v >= 1e6 ? `$${Math.round(v / 1e6)}M` : `$${Math.round(v / 1e3)}K`);
+    return `
+      <svg class="scatter" viewBox="0 0 ${W} ${H}" role="img" aria-label="Implied value against actual market cap, one dot per live-token protocol, on log axes">
+        <rect x="${pad.l}" y="${pad.t}" width="${W - pad.l - pad.r}" height="${H - pad.t - pad.b}" fill="none" stroke="#1e2a38"/>
+        ${ticks.map((t) => `<line x1="${x(t)}" y1="${pad.t}" x2="${x(t)}" y2="${H - pad.b}" stroke="#16202c"/><text x="${x(t)}" y="${H - pad.b + 16}" fill="#5d7189" font-size="10" font-family="ui-monospace,monospace" text-anchor="middle">${label(t)}</text>`).join('')}
+        ${ticks.map((t) => `<line x1="${pad.l}" y1="${y(t)}" x2="${W - pad.r}" y2="${y(t)}" stroke="#16202c"/><text x="${pad.l - 8}" y="${y(t) + 3}" fill="#5d7189" font-size="10" font-family="ui-monospace,monospace" text-anchor="end">${label(t)}</text>`).join('')}
+        <line x1="${x(10 ** lo)}" y1="${y(10 ** lo)}" x2="${x(10 ** hi)}" y2="${y(10 ** hi)}" stroke="#f5b544" stroke-dasharray="4 4" opacity="0.55"/>
+        ${points.map((p) => `<circle cx="${x(p.actual_usd).toFixed(1)}" cy="${y(p.implied_usd).toFixed(1)}" r="2.6" fill="#46c6d8" opacity="0.62"><title>${esc(p.slug)}: market ${usd(p.actual_usd)}, model ${usd(p.implied_usd)}</title></circle>`).join('')}
+        <text x="${W - pad.r}" y="${pad.t + 12}" fill="#5d7189" font-size="10" font-family="ui-monospace,monospace" text-anchor="end">x market cap · y implied value</text>
+      </svg>`;
+  }
+
+  function validation() {
+    const v = R.validation;
+    return `
+      <section class="panel" id="validation">
+        <header>
+          <h2>Does the model work?</h2>
+          <span class="sub">scored on the snapshot's own live-token protocols, each one left out in turn</span>
+        </header>
+        <div class="body">
+          <div class="kpis">
+            <div class="kpi"><div class="k">Protocols tested</div><div class="v">${v.n}</div><div class="s">every live token with a market cap</div></div>
+            <div class="kpi"><div class="k">Median error</div><div class="v amber">${v.median_error.toFixed(1)}×</div><div class="s">out of sample, either way</div></div>
+            <div class="kpi"><div class="k">Within 2×</div><div class="v">${(v.within_2x * 100).toFixed(0)}%</div><div class="s">of calls land within a factor of two</div></div>
+            <div class="kpi"><div class="k">Rank correlation</div><div class="v cyan">${v.spearman.toFixed(2)}</div><div class="s">implied order against the market's</div></div>
+          </div>
+          ${scatter(v.points)}
+          <table class="peers" style="margin-top:14px">
+            <thead><tr><th>TVL band</th><th class="n">Protocols</th><th class="n">Market's median multiple</th><th class="n">What the curve pays</th><th class="n">Gap</th></tr></thead>
+            <tbody>
+              ${v.bands
+                .map((b) => {
+                  const gap = b.curve / b.actual;
+                  return `<tr><td>${esc(b.label)}</td><td class="n">${b.n}</td><td class="n">${mult(b.actual)}</td><td class="n">${mult(b.curve)}</td><td class="n" style="color:${Math.abs(Math.log2(gap)) < 0.3 ? 'var(--green)' : 'var(--ink-dim)'}">${gap >= 1 ? '×' : '÷'}${(gap >= 1 ? gap : 1 / gap).toFixed(2)}</td></tr>`;
+                })
+                .join('')}
+            </tbody>
+          </table>
+          <p class="caveat"><b>Read this before you trust a number.</b> A market cap is not a function of TVL alone — float, supply and liquidity all move it — so the model calls the size of a launch, not its price. In every TVL band the curve's multiple lands within a third of the market's own median, which is why the board ranks with it; a single row is still a midpoint with a ${v.median_error.toFixed(1)}× band either side.</p>
         </div>
       </section>`;
   }
@@ -199,7 +287,7 @@
                 <td class="num">${usd(r.tvl_usd)}</td>
                 <td class="num ${dir(r.change_7d)}">${pct(r.change_7d)}</td>
                 <td class="num">${days(r.age_days)}</td>
-                <td class="num"><span class="mult">${r.base_multiple.toFixed(2)}x<span class="src"> ${r.multiple_source === 'category' ? `n=${r.peer_count}` : 'mkt'}</span></span></td>
+                <td class="num"><span class="mult">${mult(r.base_multiple)}<span class="src"> ${r.multiple_source === 'category' ? `×${r.category_tilt.toFixed(2)}` : 'curve'}</span></span></td>
                 <td class="num"><div class="val"><span class="num">${usd(r.implied_value_usd)}</span><span class="track"><span class="fill" style="width:${Math.max(2, Math.round((r.implied_value_usd / MAX) * 100))}%"></span></span></div></td>
               </tr>`,
                 )
@@ -216,16 +304,16 @@
       <section class="panel" id="live">
         <header>
           <h2>Already trading</h2>
-          <span class="sub">the snapshot's live-token protocols, shown at the market's own value — never ranked against the board</span>
+          <span class="sub">the snapshot's live-token protocols, at the market's own value — never ranked against the board</span>
         </header>
         <div class="body">
           <table class="peers">
-            <thead><tr><th>Protocol</th><th>Category</th><th class="n">TVL</th><th class="n">Market cap</th><th class="n">Mcap/TVL</th><th class="n">7d</th></tr></thead>
+            <thead><tr><th>Protocol</th><th>Category</th><th class="n">TVL</th><th class="n">Market cap</th><th class="n">Mcap/TVL</th><th class="n">Curve</th><th class="n">7d</th></tr></thead>
             <tbody>
               ${R.live
                 .slice(0, 12)
                 .map(
-                  (l) => `<tr><td>${esc(l.name)}</td><td>${esc(l.category || '—')}</td><td class="n">${usd(l.tvl_usd)}</td><td class="n">${l.mcap_usd ? usd(l.mcap_usd) : '—'}</td><td class="n">${l.multiple ? `${l.multiple.toFixed(2)}x` : '—'}</td><td class="n ${dir(l.change_7d)}">${pct(l.change_7d)}</td></tr>`,
+                  (l) => `<tr><td>${esc(l.name)}</td><td>${esc(l.category || '—')}</td><td class="n">${usd(l.tvl_usd)}</td><td class="n">${l.mcap_usd ? usd(l.mcap_usd) : '—'}</td><td class="n">${l.multiple ? mult(l.multiple) : '—'}</td><td class="n" style="color:var(--ink-faint)">${mult(curveAt(l.tvl_usd))}</td><td class="n ${dir(l.change_7d)}">${pct(l.change_7d)}</td></tr>`,
                 )
                 .join('')}
             </tbody>
@@ -264,7 +352,9 @@
         <h3>How the number was built</h3>
         <table class="breakdown">
           <tr><td>TVL, from the snapshot</td><td>${full(r.tvl_usd)}</td></tr>
-          <tr><td>Peer multiple · ${r.multiple_source === 'category' ? `${r.peer_count} live-token ${esc(r.category || '')} peers` : `whole market (too few ${esc(r.category || '')} peers)`}</td><td>${r.base_multiple.toFixed(2)}x → ${full(Math.round(base))}</td></tr>
+          <tr><td>Size curve at ${usd(r.tvl_usd)}</td><td>${mult(r.size_multiple)}</td></tr>
+          <tr><td>Category tilt · ${r.multiple_source === 'category' ? `${r.peer_count} live-token ${esc(r.category || '')} peers` : `too few ${esc(r.category || '')} peers, no tilt`}</td><td>${r.category_tilt.toFixed(2)}x</td></tr>
+          <tr><td>Multiple of TVL applied</td><td>${mult(r.base_multiple)} → ${full(Math.round(base))}</td></tr>
           <tr><td>Growth multiplier · 7-day ${pct(r.change_7d)}</td><td>${r.growth_multiplier.toFixed(3)}x</td></tr>
           <tr><td>Maturity multiplier · ${days(r.age_days)} without a token</td><td>${r.maturity_multiplier.toFixed(3)}x</td></tr>
           <tr><td>Reach multiplier · ${r.chains.length} chain${r.chains.length === 1 ? '' : 's'}</td><td>${r.chain_multiplier.toFixed(3)}x</td></tr>
@@ -281,6 +371,7 @@
   function readHash() {
     const parts = location.hash.replace(/^#/, '').split('&');
     let slug = null;
+    let section = null;
     for (const part of parts) {
       if (part.startsWith('p/')) { slug = decodeURIComponent(part.slice(2)); continue; }
       const at = part.indexOf('=');
@@ -292,23 +383,33 @@
       else if (key === 'chain') state.chain = val;
       else if (key === 'sort' && val) { state.sort = val; state.asc = val === 'rank'; }
       else if (key === 'wl') state.watchlist = val === '1';
+      else if (key === 's') section = val;
     }
-    return slug;
+    return { slug, section };
   }
 
   // ---------- wiring ----------
 
   function render() {
-    const openSlug = readHash();
+    const { slug: openSlug, section } = readHash();
+    // A section link (`#s=validation`) shows that panel alone: a shareable view of one part of the
+    // radar, and what this entry's own screenshots are taken from.
+    const panels = {
+      stats: () => stats(),
+      'board-table': () => board(),
+      method: () => method(),
+      validation: () => validation(),
+      accounting: () => accounting(),
+      live: () => live(),
+    };
+    const whole = () => `${stats()}${board()}${method()}${validation()}${accounting()}${live()}`;
+    const mainInner = section && panels[section] ? panels[section]() : whole();
     root.innerHTML = `
       <div class="topbar">${topbar()}</div>
       <div class="wrap">
         ${controls()}
         <main>
-          <div class="stats">${stats()}</div>
-          ${board()}
-          ${method()}
-          ${live()}
+          ${mainInner}
         </main>
       </div>
       <footer class="foot">
@@ -363,6 +464,7 @@
   /** Re-render only the board table: filters and sorts never rebuild the rest of the page. */
   function refreshBoard() {
     const holder = document.getElementById('board-table');
+    if (!holder) return;
     const fresh = document.createElement('div');
     fresh.innerHTML = board();
     holder.replaceWith(fresh.firstElementChild);
