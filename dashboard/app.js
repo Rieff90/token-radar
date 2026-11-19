@@ -322,6 +322,16 @@
       </section>`;
   }
 
+  /** The row's TVL band, the market's median multiple there, and what the curve pays: the row's context. */
+  function bandNote(r) {
+    const idx = r.tvl_usd < 1e7 ? 0 : r.tvl_usd < 1e8 ? 1 : r.tvl_usd < 1e9 ? 2 : 3;
+    const b = R.validation.bands[idx];
+    if (!b) return '';
+    const gap = b.curve / b.actual;
+    const word = gap >= 1 ? 'above' : 'below';
+    return `This row holds ${usd(r.tvl_usd)}, in the ${esc(b.label)} band, where the snapshot's ${b.n} live-token protocols pay a median ${mult(b.actual)} of TVL and the curve pays ${mult(b.curve)} — ${(gap >= 1 ? gap : 1 / gap).toFixed(2)}× ${word} the market's own.`;
+  }
+
   // ---------- the detail view ----------
 
   function detail(slug) {
@@ -359,7 +369,10 @@
           <tr><td>Maturity multiplier · ${days(r.age_days)} without a token</td><td>${r.maturity_multiplier.toFixed(3)}x</td></tr>
           <tr><td>Reach multiplier · ${r.chains.length} chain${r.chains.length === 1 ? '' : 's'}</td><td>${r.chain_multiplier.toFixed(3)}x</td></tr>
           <tr class="total"><td>Implied launch value</td><td>${full(r.implied_value_usd)}</td></tr>
+          <tr><td style="color:var(--ink-faint)">Band · the backtest's ${R.validation.median_error.toFixed(1)}× median error, either way</td><td style="color:var(--ink-faint)">${usd(r.implied_value_usd / R.validation.median_error)} – ${usd(r.implied_value_usd * R.validation.median_error)}</td></tr>
         </table>
+        <h3>Where it sits</h3>
+        <p style="margin:0;color:var(--ink-dim);font-size:12.5px">${bandNote(r)}</p>
         <h3>Chains</h3>
         <p style="margin:0;color:var(--ink-dim);font-size:12.5px">${esc(r.chains.join(', ') || 'not recorded')}${r.listed_at ? ` · first tracked ${esc(r.listed_at)}` : ''}</p>
         <h3>How to farm it</h3>
