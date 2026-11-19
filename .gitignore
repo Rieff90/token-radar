@@ -1,0 +1,5 @@
+out/
+run2/
+shots/
+node_modules/
+*.tar.gz
